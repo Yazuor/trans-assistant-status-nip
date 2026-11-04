@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Trans Assistant - Status NIP
 // @namespace    https://github.com/Yazuor/trans-assistant-status-nip
-// @version      1.0.4
+// @version      1.0.5
 // @description  NIP rozmówcy i status klienta/przewoźnika w intranecie. Bez Bridge i pozostałych modułów Trans Assistant.
 // @author       Yazuor
 // @match        https://platform.trans.eu/*
@@ -30,7 +30,7 @@
     'use strict';
     if (window.top !== window) return;
     const page = unsafeWindow;
-    const VERSION='1.0.4';
+    const VERSION='1.0.5';
     // New protocol also invalidates potentially false negative results from 1.0.0.
     const PREFIX = 'ta-status-nip:v2:', WAKE = PREFIX + 'wake';
     const BADGE = 'ta-status-nip-badge', FRAME_PARAM = 'taStatusNipFrame';
@@ -51,9 +51,13 @@
         const digits = valueText.replace(/\D/g, '');
         return /^\d{10}$/.test(digits) ? digits : '';
     }
+    function nipsInText(value) {
+        // Intranet joins the company name and NIP without a separator.
+        // Letters may touch the number; an extra digit must not match.
+        return Array.from(text(value).matchAll(/(?<!\d)(?:PL[\s-]*)?(\d{3}[\s-]?\d{3}[\s-]?\d{2}[\s-]?\d{2})(?!\d)/gi),match=>nipDigits(match[1]));
+    }
     function exactNipInText(value, nip) {
-        return Array.from(text(value).matchAll(/\b(?:PL[\s-]*)?(\d{3}[\s-]?\d{3}[\s-]?\d{2}[\s-]?\d{2})\b/gi))
-            .some(match => nipDigits(match[1]) === nip);
+        return nipsInText(value).includes(nip);
     }
     function cacheKey(nip) { return PREFIX + 'cache:' + nip; }
     function cached(nip) {
@@ -212,7 +216,7 @@
                     const clean=!parsed.querySelector('form,input,script')&&!/fatal error|warning:|ora-\d|sqlstate/i.test(body);
                     // A completed native search may return an empty body, an empty
                     // list, a list with a no-result label, or other NIP matches.
-                    const otherNips=links.length>0&&links.every(link=>/\b(?:PL[\s-]*)?\d{3}[\s-]?\d{3}[\s-]?\d{2}[\s-]?\d{2}\b/i.test(link.textContent));
+                    const otherNips=links.length>0&&links.every(link=>nipsInText(link.textContent).length>0);
                     const noResults=/^(?:brak\b.*|nie znaleziono\b.*|no results\b.*)$/i.test(fold(parsed.body.textContent));
                     if(!text(body)||clean&&(list&&(!links.length||otherNips)||noResults))return finish(null,{link:null,input});
                     finish(new Error('Nierozpoznana odpowiedź wyszukiwarki '+selector+' (HTTP '+status+', listy: '+parsed.querySelectorAll('ul').length+', odnośniki: '+links.length+').'));
