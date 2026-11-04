@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Trans Assistant - Status NIP
 // @namespace    https://github.com/Yazuor/trans-assistant-status-nip
-// @version      1.0.1
+// @version      1.0.2
 // @description  NIP rozmówcy i status klienta/przewoźnika w intranecie. Bez Bridge i pozostałych modułów Trans Assistant.
 // @author       Yazuor
 // @match        https://platform.trans.eu/*
@@ -33,7 +33,7 @@
     // New protocol also invalidates potentially false negative results from 1.0.0.
     const PREFIX = 'ta-status-nip:v2:', WAKE = PREFIX + 'wake';
     const BADGE = 'ta-status-nip-badge', FRAME_PARAM = 'taStatusNipFrame';
-    const CACHE_MS = 5 * 60 * 1000, REQUEST_MS = 60000;
+    const CACHE_MS = 5 * 60 * 1000, REQUEST_MS = 30000;
     const instance = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const capturedChunks=new WeakSet();
     const patchedOwners=new WeakSet();
@@ -76,21 +76,34 @@
         const id = `${instance}-${Math.random().toString(36).slice(2)}`;
         const key = PREFIX + 'request:' + id;
         return new Promise((resolve, reject) => {
-            let listener, timer, settled = false;
+            let listener, timer, poll, acknowledged=false, settled = false;
+            const started=Date.now();
             const finish = (error, result) => {
                 if (settled) return;
                 settled = true;
                 clearTimeout(timer);
+                clearInterval(poll);
                 if (listener !== undefined) GM_removeValueChangeListener(listener);
                 GM_deleteValue(key);
                 error ? reject(error) : resolve(result);
             };
-            listener = GM_addValueChangeListener(key, (_key, _old, result) => {
-                if (result?.id !== id || result.nip !== nip || result.state !== 'done') return;
+            const receive = result => {
+                if (result?.id !== id || result.nip !== nip) return;
+                if(result.state==='processing')acknowledged=true;
+                if(result.state!=='done')return;
                 if (result.error) finish(new Error(result.error));
                 else if (['client','carrier','blocked'].every(field => typeof result[field] === 'boolean')) finish(null, result);
-            });
-            timer = setTimeout(() => finish(new Error('Otwórz zalogowaną kartę intranetu w tym samym profilu przeglądarki i spróbuj ponownie.')), REQUEST_MS);
+            };
+            listener = GM_addValueChangeListener(key, (_key, _old, result) => receive(result));
+            // Only while this request is pending: recover a missed GM notification.
+            // These are local extension reads, not requests to the intranet.
+            poll=setInterval(()=>{
+                receive(GM_getValue(key,null));
+                if(settled)return;
+                if(!acknowledged&&Date.now()-started>=8000)finish(new Error('Karta intranetu nie odebrała zapytania. Przejdź na nią i sprawdź, czy Status NIP jest tam włączony oraz zaktualizowany.'));
+                else if(!acknowledged)GM_setValue(WAKE,id+':'+Date.now());
+            },1000);
+            timer = setTimeout(() => finish(new Error(acknowledged?'Intranet odebrał zapytanie, ale nie zakończył sprawdzania w ciągu 30 s.':'Otwórz zalogowaną kartę intranetu w tym samym profilu przeglądarki i spróbuj ponownie.')), REQUEST_MS);
             GM_setValue(key, {id, nip, state:'pending', createdAt:Date.now(), force});
             GM_setValue(WAKE, id);
         });
@@ -169,7 +182,7 @@
             frame.src=url.href;document.documentElement.appendChild(frame);
         });
     }
-    function watchSearchResponses(w,nip) {
+    function watchSearchResponses(w,nip,onChange) {
         const state={started:0,pending:0,finishedAt:0,status:0,empty:false,positive:false};
         const metadata=new WeakMap(),proto=w.XMLHttpRequest?.prototype;
         const open=proto?.open,send=proto?.send,fetch=w.fetch;
@@ -190,6 +203,7 @@
                 state.empty=/^<ul\b/i.test(text(body))&&children.length===1&&children[0].tagName==='UL'&&!children[0].querySelector('a')&&
                     (!text(children[0].textContent)||/brak.*wynik|nie znaleziono|no results/.test(fold(children[0].textContent)));
             }
+            onChange();
         };
         let wrappedOpen,wrappedSend,wrappedFetch;
         if(proto&&open&&send){
@@ -197,7 +211,7 @@
             wrappedSend=pageFunction(function(...args){
                 if(contains(metadata.get(this)||'')||contains(args[0])){
                     state.started++;state.pending++;
-                    this.addEventListener('loadend',()=>{let body='';try{body=this.responseText;}catch{}complete(Number(this.status)||0,body);},{once:true});
+                    this.addEventListener('loadend',pageFunction(()=>{let body='';try{body=this.responseText;}catch{}complete(Number(this.status)||0,body);},w),pageObject({once:true},w));
                 }
                 return send.apply(this,args);
             },w);
@@ -227,27 +241,34 @@
         const doc=frame.contentDocument, input=doc?.querySelector(selector);
         if (!input) throw new Error('Brak wyszukiwarki intranetu. Sprawdź logowanie.');
         const w=frame.contentWindow.wrappedJSObject||frame.contentWindow;
-        const receipt=watchSearchResponses(w,nip);
+        let check=()=>{};
+        const receipt=watchSearchResponses(w,nip,()=>check());
         try{
-            input.focus({preventScroll:true});input.value=nip;
-            input.dispatchEvent(new w.Event('input',{bubbles:true}));
-            const keyCode=48+Number(nip.slice(-1));
-            input.dispatchEvent(new w.KeyboardEvent('keyup',{bubbles:true,key:nip.slice(-1),code:`Digit${nip.slice(-1)}`,keyCode,which:keyCode}));
-            input.dispatchEvent(new w.Event('change',{bubbles:true}));
-            const start=Date.now();
-            while(Date.now()-start<10000){
+            return await new Promise((resolve,reject)=>{
+            let settled=false;
+            const observer=new MutationObserver(()=>check());
+            const timer=setTimeout(()=>finish(new Error('Brak potwierdzonej odpowiedzi wyszukiwarki intranetu. Sprawdź logowanie i ponów odczyt.')),10000);
+            const finish=(error,result)=>{if(settled)return;settled=true;clearTimeout(timer);observer.disconnect();error?reject(error):resolve(result);};
+            check=()=>{
+                if(settled||!receipt.started||receipt.pending!==0||!receipt.finishedAt)return;
+                if(receipt.status<200||receipt.status>=300)return finish(new Error(`Wyszukiwarka intranetu: HTTP ${receipt.status}.`));
                 const box=doc.querySelector('#results3');
                 const matches=Array.from(box?.querySelectorAll('a')||[]).filter(link=>exactNipInText(link.textContent,nip));
-                if(receipt.started&&receipt.pending===0&&Date.now()-receipt.finishedAt>=200){
-                    if(receipt.status<200||receipt.status>=300)throw new Error(`Wyszukiwarka intranetu: HTTP ${receipt.status}.`);
-                    if(matches.length>1)throw new Error('Kilka wyników dla tego NIP-u. Sprawdź firmę w intranecie.');
-                    if(receipt.positive&&matches.length===1)return {link:matches[0],input};
-                    if(receipt.empty&&box?.querySelector('ul')&&!box.querySelector('a'))return {link:null,input};
-                    if(Date.now()-receipt.finishedAt>1000)throw new Error('Wynik wyszukiwania nie potwierdza NIP-u. Nie oznaczam firmy jako brakującej.');
-                }
-                await sleep(120);
-            }
-            throw new Error('Brak potwierdzonej odpowiedzi wyszukiwarki intranetu. Sprawdź logowanie i ponów odczyt.');
+                if(matches.length>1)return finish(new Error('Kilka wyników dla tego NIP-u. Sprawdź firmę w intranecie.'));
+                if(receipt.positive&&matches.length===1)return finish(null,{link:matches[0],input});
+                if(receipt.empty&&box?.querySelector('ul')&&!box.querySelector('a'))return finish(null,{link:null,input});
+                if(!receipt.positive&&!receipt.empty)finish(new Error('Wynik wyszukiwania nie potwierdza NIP-u. Nie oznaczam firmy jako brakującej.'));
+            };
+            observer.observe(doc.documentElement,{childList:true,subtree:true,characterData:true});
+            try{
+            input.focus();input.value=nip;
+            input.dispatchEvent(new w.Event('input',pageObject({bubbles:true},w)));
+            const keyCode=48+Number(nip.slice(-1));
+            input.dispatchEvent(new w.KeyboardEvent('keyup',pageObject({bubbles:true,key:nip.slice(-1),code:`Digit${nip.slice(-1)}`,keyCode,which:keyCode},w)));
+            input.dispatchEvent(new w.Event('change',pageObject({bubbles:true},w)));
+            check();
+            }catch(error){finish(error);}
+            });
         }finally{receipt.restore();}
     }
     async function inspectClient(nip) {
@@ -263,12 +284,12 @@
             if(!form||!button)throw new Error('Brak przycisku wyboru klienta.');
             const url=new URL(form.getAttribute('action')||frame.contentWindow.location.href,frame.contentWindow.location.href);
             if(url.origin!==location.origin || !url.pathname.startsWith('/spedycja_uss_2022/'))throw new Error('Nieprawidłowy adres formularza klienta.');
-            const data=new frame.contentWindow.FormData(form);
+            const data=new FormData(form);
             if(button.name)data.append(button.name,button.value||'');
             const method=text(form.method||'POST').toUpperCase();
             if(!['GET','POST'].includes(method))throw new Error('Nieobsługiwany formularz klienta.');
             if(method==='GET')for(const [key,value] of data)url.searchParams.append(key,String(value));
-            const response=await frame.contentWindow.fetch(url.href,{method,credentials:'same-origin',...(method==='POST'?{body:data}:{}),signal:AbortSignal.timeout(10000)});
+            const response=await fetch(url.href,{method,credentials:'same-origin',...(method==='POST'?{body:data}:{}),signal:AbortSignal.timeout(10000)});
             if(!response.ok)throw new Error(`Intranet: HTTP ${response.status}.`);
             const html=await response.text();
             const active=/<form\b[^>]*\bname=["']?add_offer["']?/i.test(html);
