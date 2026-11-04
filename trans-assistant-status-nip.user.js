@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Trans Assistant - Status NIP
 // @namespace    https://github.com/Yazuor/trans-assistant-status-nip
-// @version      1.0.0
-// @description  NIP rozmówcy i status klienta/przewoźnika
+// @version      1.0.1
+// @description  NIP rozmówcy i status klienta/przewoźnika w intranecie. Bez Bridge i pozostałych modułów Trans Assistant.
 // @author       Yazuor
 // @match        https://platform.trans.eu/*
 // @match        http://intranet/spedycja_uss_2022/*
@@ -30,15 +30,20 @@
     'use strict';
     if (window.top !== window) return;
     const page = unsafeWindow;
-    const PREFIX = 'ta-status-nip:v1:', WAKE = PREFIX + 'wake';
+    // New protocol also invalidates potentially false negative results from 1.0.0.
+    const PREFIX = 'ta-status-nip:v2:', WAKE = PREFIX + 'wake';
     const BADGE = 'ta-status-nip-badge', FRAME_PARAM = 'taStatusNipFrame';
     const CACHE_MS = 5 * 60 * 1000, REQUEST_MS = 60000;
     const instance = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const capturedChunks=new WeakSet();
+    const patchedOwners=new WeakSet();
+    let localServices=null;
     const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
     const text = value => String(value ?? '').trim();
     const fold = value => text(value).normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/ł/g, 'l').toLowerCase();
     const escape = value => text(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    const pageFunction = (fn, scope=page) => typeof exportFunction === 'function' ? exportFunction(fn,scope) : fn;
+    const pageObject = (value, scope=page) => typeof cloneInto === 'function' ? cloneInto(value,scope,{cloneFunctions:true,wrapReflectors:true}) : value;
     function nipDigits(value) {
         const valueText = text(value).replace(/^PL[\s-]*/i, '');
         if (!/^[\d\s-]+$/.test(valueText)) return '';
@@ -85,7 +90,7 @@
                 if (result.error) finish(new Error(result.error));
                 else if (['client','carrier','blocked'].every(field => typeof result[field] === 'boolean')) finish(null, result);
             });
-            timer = setTimeout(() => finish(new Error('Otwórz zalogowaną kartę intranetu w tym samym profilu Chrome i spróbuj ponownie.')), REQUEST_MS);
+            timer = setTimeout(() => finish(new Error('Otwórz zalogowaną kartę intranetu w tym samym profilu przeglądarki i spróbuj ponownie.')), REQUEST_MS);
             GM_setValue(key, {id, nip, state:'pending', createdAt:Date.now(), force});
             GM_setValue(WAKE, id);
         });
@@ -164,24 +169,86 @@
             frame.src=url.href;document.documentElement.appendChild(frame);
         });
     }
+    function watchSearchResponses(w,nip) {
+        const state={started:0,pending:0,finishedAt:0,status:0,empty:false,positive:false};
+        const metadata=new WeakMap(),proto=w.XMLHttpRequest?.prototype;
+        const open=proto?.open,send=proto?.send,fetch=w.fetch;
+        const contains=raw=>{
+            try{for(const value of new URL(String(raw),w.location.href).searchParams.values())if(nipDigits(value)===nip)return true;}catch{}
+            if(raw?.entries){try{for(const [,value] of raw.entries())if(nipDigits(value)===nip)return true;}catch{}}
+            if(typeof raw==='string'){try{for(const value of new URLSearchParams(raw).values())if(nipDigits(value)===nip)return true;}catch{}}
+            return false;
+        };
+        const complete=(status,body)=>{
+            state.pending--;state.status=status;state.finishedAt=Date.now();state.empty=false;state.positive=false;
+            if(status>=200&&status<300&&typeof body==='string'){
+                const parsed=new DOMParser().parseFromString(body,'text/html');
+                const children=parsed.body.children;
+                state.positive=Array.from(parsed.querySelectorAll('a')).some(link=>exactNipInText(link.textContent,nip));
+                // Only an actual empty autocomplete response proves absence.
+                // A pre-existing empty UL, login page or unrelated response does not.
+                state.empty=/^<ul\b/i.test(text(body))&&children.length===1&&children[0].tagName==='UL'&&!children[0].querySelector('a')&&
+                    (!text(children[0].textContent)||/brak.*wynik|nie znaleziono|no results/.test(fold(children[0].textContent)));
+            }
+        };
+        let wrappedOpen,wrappedSend,wrappedFetch;
+        if(proto&&open&&send){
+            wrappedOpen=pageFunction(function(...args){metadata.set(this,String(args[1]||''));return open.apply(this,args);},w);
+            wrappedSend=pageFunction(function(...args){
+                if(contains(metadata.get(this)||'')||contains(args[0])){
+                    state.started++;state.pending++;
+                    this.addEventListener('loadend',()=>{let body='';try{body=this.responseText;}catch{}complete(Number(this.status)||0,body);},{once:true});
+                }
+                return send.apply(this,args);
+            },w);
+            proto.open=wrappedOpen;proto.send=wrappedSend;
+        }
+        if(typeof fetch==='function'){
+            wrappedFetch=pageFunction(function(input,init){
+                const match=contains(typeof input==='string'?input:input?.url||'')||contains(init?.body);
+                if(match){state.started++;state.pending++;}
+                let result;
+                try{result=fetch.apply(this,arguments);}catch(error){if(match)complete(0,'');throw error;}
+                if(match)Promise.resolve(result).then(async response=>{
+                    try{complete(response.status,await response.clone().text());}catch{complete(0,'');}
+                },()=>complete(0,''));
+                return result;
+            },w);
+            w.fetch=wrappedFetch;
+        }
+        state.restore=()=>{
+            if(proto?.open===wrappedOpen)proto.open=open;
+            if(proto?.send===wrappedSend)proto.send=send;
+            if(w.fetch===wrappedFetch)w.fetch=fetch;
+        };
+        return state;
+    }
     async function autocomplete(frame, selector, nip) {
         const doc=frame.contentDocument, input=doc?.querySelector(selector);
         if (!input) throw new Error('Brak wyszukiwarki intranetu. Sprawdź logowanie.');
-        const w=frame.contentWindow;
-        input.value=nip;
-        input.dispatchEvent(new w.Event('input',{bubbles:true}));
-        input.dispatchEvent(new w.KeyboardEvent('keyup',{bubbles:true,key:nip.slice(-1),code:`Digit${nip.slice(-1)}`}));
-        input.dispatchEvent(new w.Event('change',{bubbles:true}));
-        const start=Date.now();
-        while(Date.now()-start<8500){
-            const box=doc.querySelector('#results3');
-            const matches=Array.from(box?.querySelectorAll('a')||[]).filter(link=>exactNipInText(link.textContent,nip));
-            if(matches.length>1)throw new Error('Kilka wyników dla tego NIP-u. Sprawdź firmę w intranecie.');
-            if(matches.length===1)return {link:matches[0],input};
-            if(box?.querySelector('ul') && box.style.display!=='none')return {link:null,input};
-            await sleep(120);
-        }
-        throw new Error('Wyszukiwanie w intranecie nie zwróciło wyniku.');
+        const w=frame.contentWindow.wrappedJSObject||frame.contentWindow;
+        const receipt=watchSearchResponses(w,nip);
+        try{
+            input.focus({preventScroll:true});input.value=nip;
+            input.dispatchEvent(new w.Event('input',{bubbles:true}));
+            const keyCode=48+Number(nip.slice(-1));
+            input.dispatchEvent(new w.KeyboardEvent('keyup',{bubbles:true,key:nip.slice(-1),code:`Digit${nip.slice(-1)}`,keyCode,which:keyCode}));
+            input.dispatchEvent(new w.Event('change',{bubbles:true}));
+            const start=Date.now();
+            while(Date.now()-start<10000){
+                const box=doc.querySelector('#results3');
+                const matches=Array.from(box?.querySelectorAll('a')||[]).filter(link=>exactNipInText(link.textContent,nip));
+                if(receipt.started&&receipt.pending===0&&Date.now()-receipt.finishedAt>=200){
+                    if(receipt.status<200||receipt.status>=300)throw new Error(`Wyszukiwarka intranetu: HTTP ${receipt.status}.`);
+                    if(matches.length>1)throw new Error('Kilka wyników dla tego NIP-u. Sprawdź firmę w intranecie.');
+                    if(receipt.positive&&matches.length===1)return {link:matches[0],input};
+                    if(receipt.empty&&box?.querySelector('ul')&&!box.querySelector('a'))return {link:null,input};
+                    if(Date.now()-receipt.finishedAt>1000)throw new Error('Wynik wyszukiwania nie potwierdza NIP-u. Nie oznaczam firmy jako brakującej.');
+                }
+                await sleep(120);
+            }
+            throw new Error('Brak potwierdzonej odpowiedzi wyszukiwarki intranetu. Sprawdź logowanie i ponów odczyt.');
+        }finally{receipt.restore();}
     }
     async function inspectClient(nip) {
         const frame=await lookupFrame('/spedycja_uss_2022//oferta/dodanie.php');
@@ -237,30 +304,33 @@
     }
     function captureServices(value){
         const found=serviceContainer(value);
-        if(found && page.__TA_STATUS_NIP_SERVICES__!==found){page.__TA_STATUS_NIP_SERVICES__=found;queueMicrotask(()=>window.dispatchEvent(new Event('ta-status-nip-services')));}
+        if(found&&localServices!==found){localServices=found;
+            try{page.__TA_STATUS_NIP_SERVICES__=found;}catch{/* Keep the local capture if cross-compartment assignment is restricted. */}
+            queueMicrotask(()=>window.dispatchEvent(new Event('ta-status-nip-services')));
+        }
         return found;
     }
     function patchServices(target){
         if(!target)return;
         captureServices(target);
         const owner=typeof target.prototype?.setup==='function'?target.prototype:target;
-        if(typeof owner.setup!=='function'||owner.setup.__statusNipPatched)return;
+        if(typeof owner.setup!=='function'||patchedOwners.has(owner))return;
         const original=owner.setup;
-        const wrapped=function(...args){
+        const wrapped=pageFunction(function(...args){
             const result=original.apply(this,args);
             captureServices(this);captureServices(result);
             if(result?.then)result.then(value=>captureServices(value),()=>{});
             return result;
-        };
-        wrapped.__statusNipPatched=true;owner.setup=wrapped;
+        });
+        owner.setup=wrapped;patchedOwners.add(owner);
     }
     function discoverServices(){
-        if(captureServices(page.__TA_STATUS_NIP_SERVICES__))return;
+        if(localServices||captureServices(page.__TA_STATUS_NIP_SERVICES__))return;
         // Same known service module as Assistant Core. Never execute arbitrary
         // module IDs or invoke service setup ourselves.
         for(const key of Object.keys(page).filter(key=>/^webpackChunkWebMessenger$/i.test(key))){
             const chunk=page[key];if(!Array.isArray(chunk)||capturedChunks.has(chunk))continue;
-            let req;chunk.push([[`status-nip-${instance}-${Math.random().toString(36).slice(2)}`],{},runtime=>{req=runtime;}]);
+            let req;chunk.push(pageObject([[`status-nip-${instance}-${Math.random().toString(36).slice(2)}`],{},runtime=>{req=runtime;}]));
             if(typeof req!=='function')continue;
             try{const mod=req('8076');
                 capturedChunks.add(chunk);
@@ -297,7 +367,7 @@
     }
     function availableServices(runtime){
         const roots=[page];try{if(page.opener)roots.push(page.opener);}catch{}
-        const direct=serviceContainer(runtime?.services)||serviceContainer(page.__TA_STATUS_NIP_SERVICES__);
+        const direct=serviceContainer(runtime?.services)||localServices||serviceContainer(page.__TA_STATUS_NIP_SERVICES__);
         if(direct)return direct;
         for(const root of roots){try{const found=serviceContainer(root.__TA_STATUS_NIP_SERVICES__);if(found)return found;}catch{}}
         return null;
@@ -309,7 +379,7 @@
             const finish=(error,result)=>{if(settled)return;settled=true;clearTimeout(timer);subscription?.unsubscribe?.();error?reject(error):resolve(result);};
             const timer=setTimeout(()=>finish(new Error('Przekroczono czas pobierania danych firmy.')),6000);
             const observer={next:value=>finish(null,value),error:error=>finish(error),complete:()=>finish(null,null)};
-            try{subscription=value.subscribe(observer);}catch{subscription=value.subscribe(observer.next,observer.error,observer.complete);}
+            try{subscription=value.subscribe(pageObject(observer));}catch{subscription=value.subscribe(pageFunction(observer.next),pageFunction(observer.error),pageFunction(observer.complete));}
             if(settled)subscription?.unsubscribe?.();
         });
     }
@@ -341,6 +411,7 @@
     }
     function bootTrans(){
         let generation=0,current=null,timer=0,scheduled=false,companyAttempts=0;
+        let startupAt=Date.now();
         const style=document.createElement('style');style.textContent=badgeCss();document.documentElement.appendChild(style);
         function hostFor(partner){
             const hints=[partner?.givenName,partner?.familyName,partner?.mobile].map(fold).filter(h=>h.length>=4);
@@ -376,13 +447,15 @@
         async function refresh(force=false){
             const identity=popupIdentity();if(!identity){current=null;document.getElementById(BADGE)?.remove();return;}
             const key=JSON.stringify(identity),token=++generation;
-            if(current?.identity!==key){companyAttempts=0;current={identity:key,nip:'',partner:null};}
-            if(force){companyAttempts=0;current.error='';current.result=null;}
+            if(current?.identity!==key){companyAttempts=0;startupAt=Date.now();current={identity:key,nip:'',partner:null};}
+            if(force){companyAttempts=0;startupAt=Date.now();current.error='';current.result=null;}
             if(companyAttempts>=3&&!force){draw();return;}
-            clearTimeout(timer);discoverServices();
-            const runtime=findRuntime(identity),companyId=text(runtime?.interlocutor?.companyId||runtime?.interlocutor?.transId?.companyId);
-            const services=availableServices(runtime);
+            clearTimeout(timer);
+            let runtime,companyId,services;
+            try{discoverServices();runtime=findRuntime(identity);companyId=text(runtime?.interlocutor?.companyId||runtime?.interlocutor?.transId?.companyId);services=availableServices(runtime);}
+            catch{current.error='Przeglądarka nie udostępniła danych Messengera. Odśwież rozmowę i sprawdź uprawnienia skryptu.';timer=-1;draw();return;}
             if(!runtime||!companyId||!services){
+                if(Date.now()-startupAt>=25000){current.error='Nie odczytano firmy z Messengera. Odśwież rozmowę lub ponów odczyt prawym przyciskiem.';timer=-1;draw();return;}
                 draw();timer=setTimeout(()=>refresh(),Math.min(10000,1000*Math.max(1,++startupAttempts)));return;
             }
             current.partner=runtime.interlocutor;draw();companyAttempts++;
@@ -404,9 +477,9 @@
             if(current?.nip){draw();return;}if(!timer)refresh();},250);};
         // Capture services in the main app too so detached conversation windows can
         // reuse the native service through their same-origin opener.
-        discoverServices();
+        try{discoverServices();}catch{}
         let discoveryAttempts=0;
-        const discoveryTimer=setInterval(()=>{discoverServices();if(page.__TA_STATUS_NIP_SERVICES__||++discoveryAttempts>=30)clearInterval(discoveryTimer);},1000);
+        const discoveryTimer=setInterval(()=>{try{discoverServices();}catch{}if(localServices||++discoveryAttempts>=30)clearInterval(discoveryTimer);},1000);
         const observer=new MutationObserver(records=>{if(records.some(r=>!r.target.closest?.('#'+BADGE)))schedule();});
         observer.observe(document.documentElement,{childList:true,subtree:true});
         window.addEventListener('hashchange',()=>{generation++;clearTimeout(timer);timer=0;startupAttempts=0;refresh();});
