@@ -2,7 +2,7 @@
 // @name         Trans Assistant - Status NIP
 // @namespace    https://github.com/Yazuor/trans-assistant-status-nip
 // @version      1.0.0
-// @description  NIP rozmówcy i status klienta/przewoźnika w intranecie. Bez Bridge i pozostałych modułów Trans Assistant.
+// @description  NIP rozmówcy i status klienta/przewoźnika
 // @author       Yazuor
 // @match        https://platform.trans.eu/*
 // @match        http://intranet/spedycja_uss_2022/*
