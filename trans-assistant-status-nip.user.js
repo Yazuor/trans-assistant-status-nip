@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Trans Assistant - Status NIP
 // @namespace    https://github.com/Yazuor/trans-assistant-status-nip
-// @version      1.0.2
+// @version      1.0.3
 // @description  NIP rozmówcy i status klienta/przewoźnika w intranecie. Bez Bridge i pozostałych modułów Trans Assistant.
 // @author       Yazuor
 // @match        https://platform.trans.eu/*
@@ -30,6 +30,7 @@
     'use strict';
     if (window.top !== window) return;
     const page = unsafeWindow;
+    const VERSION='1.0.3';
     // New protocol also invalidates potentially false negative results from 1.0.0.
     const PREFIX = 'ta-status-nip:v2:', WAKE = PREFIX + 'wake';
     const BADGE = 'ta-status-nip-badge', FRAME_PARAM = 'taStatusNipFrame';
@@ -91,7 +92,7 @@
                 if (result?.id !== id || result.nip !== nip) return;
                 if(result.state==='processing')acknowledged=true;
                 if(result.state!=='done')return;
-                if (result.error) finish(new Error(result.error));
+                if (result.error) finish(new Error(`${result.error} [intranet ${result.workerVersion||'starsza wersja'}]`));
                 else if (['client','carrier','blocked'].every(field => typeof result[field] === 'boolean')) finish(null, result);
             };
             listener = GM_addValueChangeListener(key, (_key, _old, result) => receive(result));
@@ -152,7 +153,7 @@
                         }
                     } catch (error) { result = {error:error.message || 'Nie udało się sprawdzić intranetu.'}; }
                     const current = GM_getValue(key, null);
-                    if (current?.owner === instance && current.id === job.id) GM_setValue(key, {...job, ...result, state:'done'});
+                    if (current?.owner === instance && current.id === job.id) GM_setValue(key, {...job, ...result, workerVersion:VERSION, state:'done'});
                 }
             } catch (error) { console.warn('[Status NIP] Sprawdź dostęp do zalogowanego intranetu.', error.message); }
             finally {
@@ -200,8 +201,11 @@
                 state.positive=Array.from(parsed.querySelectorAll('a')).some(link=>exactNipInText(link.textContent,nip));
                 // Only an actual empty autocomplete response proves absence.
                 // A pre-existing empty UL, login page or unrelated response does not.
-                state.empty=/^<ul\b/i.test(text(body))&&children.length===1&&children[0].tagName==='UL'&&!children[0].querySelector('a')&&
-                    (!text(children[0].textContent)||/brak.*wynik|nie znaleziono|no results/.test(fold(children[0].textContent)));
+                const plain=fold(parsed.body.textContent);
+                const emptyList=/^<ul\b/i.test(text(body))&&children.length===1&&children[0].tagName==='UL';
+                const noResults=/^(?:brak\b.*(?:wynik|rekord|firm|przewoznik).*|nie znaleziono\b.*|no results\b.*)[.!\s]*$/.test(plain);
+                state.empty=!text(body)||!parsed.querySelector('a,form,input,script')&&
+                    (emptyList&&(!plain||noResults)||noResults);
             }
             onChange();
         };
@@ -256,16 +260,18 @@
                 const matches=Array.from(box?.querySelectorAll('a')||[]).filter(link=>exactNipInText(link.textContent,nip));
                 if(matches.length>1)return finish(new Error('Kilka wyników dla tego NIP-u. Sprawdź firmę w intranecie.'));
                 if(receipt.positive&&matches.length===1)return finish(null,{link:matches[0],input});
-                if(receipt.empty&&box?.querySelector('ul')&&!box.querySelector('a'))return finish(null,{link:null,input});
+                if(receipt.empty&&box&&!box.querySelector('a'))return finish(null,{link:null,input});
                 if(!receipt.positive&&!receipt.empty)finish(new Error('Wynik wyszukiwania nie potwierdza NIP-u. Nie oznaczam firmy jako brakującej.'));
             };
             observer.observe(doc.documentElement,{childList:true,subtree:true,characterData:true});
             try{
             input.focus();input.value=nip;
-            input.dispatchEvent(new w.Event('input',pageObject({bubbles:true},w)));
+            // Construct DOM events in the userscript realm. Page constructors
+            // cannot read a Firefox userscript's EventInit object reliably.
+            input.dispatchEvent(new Event('input',{bubbles:true}));
             const keyCode=48+Number(nip.slice(-1));
-            input.dispatchEvent(new w.KeyboardEvent('keyup',pageObject({bubbles:true,key:nip.slice(-1),code:`Digit${nip.slice(-1)}`,keyCode,which:keyCode},w)));
-            input.dispatchEvent(new w.Event('change',pageObject({bubbles:true},w)));
+            input.dispatchEvent(new KeyboardEvent('keyup',{bubbles:true,key:nip.slice(-1),code:`Digit${nip.slice(-1)}`,keyCode,which:keyCode}));
+            input.dispatchEvent(new Event('change',{bubbles:true}));
             check();
             }catch(error){finish(error);}
             });
@@ -458,7 +464,7 @@
             const entry=current.result;
             const status=current.error?'error':entry?.blocked?'blocked':entry&&(entry.client||entry.carrier)?'ok':entry?'missing':'loading';
             const label=current.error||(!current.nip?'Pobieranie NIP-u firmy…':!entry?'Sprawdzanie w intranecie':entry.blocked?'Kontrahent zablokowany':entry.client||entry.carrier?'Kontrahent aktywny':'Brak w bazie');
-            badge.title=label+' · Kliknij, aby skopiować NIP. Prawy przycisk: odśwież status.';
+            badge.title=label+` · Status NIP ${VERSION}`+' · Kliknij, aby skopiować NIP. Prawy przycisk: odśwież status.';
             badge.setAttribute('aria-label',label);badge.dataset.state=status;badge.dataset.nip=current.nip||'';
             const markup=`<span class="ta-nip-line"><span>NIP</span><strong>${escape(current.nip||'…')}</strong><i aria-hidden="true">⧉</i></span><span class="ta-nip-status ${status}">${entry?.client?icon('client'):''}${entry?.carrier?icon('carrier'):''}<i class="${status==='loading'?'ta-nip-spinner':'ta-nip-dot'}" aria-hidden="true"></i><span class="ta-nip-sr">${escape(label)}</span></span>`;
             if(badge.innerHTML!==markup)badge.innerHTML=markup;
