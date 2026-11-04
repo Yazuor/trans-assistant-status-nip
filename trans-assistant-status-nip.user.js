@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Trans Assistant - Status NIP
 // @namespace    https://github.com/Yazuor/trans-assistant-status-nip
-// @version      1.0.3
+// @version      1.0.4
 // @description  NIP rozmówcy i status klienta/przewoźnika w intranecie. Bez Bridge i pozostałych modułów Trans Assistant.
 // @author       Yazuor
 // @match        https://platform.trans.eu/*
@@ -30,7 +30,7 @@
     'use strict';
     if (window.top !== window) return;
     const page = unsafeWindow;
-    const VERSION='1.0.3';
+    const VERSION='1.0.4';
     // New protocol also invalidates potentially false negative results from 1.0.0.
     const PREFIX = 'ta-status-nip:v2:', WAKE = PREFIX + 'wake';
     const BADGE = 'ta-status-nip-badge', FRAME_PARAM = 'taStatusNipFrame';
@@ -183,99 +183,48 @@
             frame.src=url.href;document.documentElement.appendChild(frame);
         });
     }
-    function watchSearchResponses(w,nip,onChange) {
-        const state={started:0,pending:0,finishedAt:0,status:0,empty:false,positive:false};
-        const metadata=new WeakMap(),proto=w.XMLHttpRequest?.prototype;
-        const open=proto?.open,send=proto?.send,fetch=w.fetch;
-        const contains=raw=>{
-            try{for(const value of new URL(String(raw),w.location.href).searchParams.values())if(nipDigits(value)===nip)return true;}catch{}
-            if(raw?.entries){try{for(const [,value] of raw.entries())if(nipDigits(value)===nip)return true;}catch{}}
-            if(typeof raw==='string'){try{for(const value of new URLSearchParams(raw).values())if(nipDigits(value)===nip)return true;}catch{}}
-            return false;
-        };
-        const complete=(status,body)=>{
-            state.pending--;state.status=status;state.finishedAt=Date.now();state.empty=false;state.positive=false;
-            if(status>=200&&status<300&&typeof body==='string'){
-                const parsed=new DOMParser().parseFromString(body,'text/html');
-                const children=parsed.body.children;
-                state.positive=Array.from(parsed.querySelectorAll('a')).some(link=>exactNipInText(link.textContent,nip));
-                // Only an actual empty autocomplete response proves absence.
-                // A pre-existing empty UL, login page or unrelated response does not.
-                const plain=fold(parsed.body.textContent);
-                const emptyList=/^<ul\b/i.test(text(body))&&children.length===1&&children[0].tagName==='UL';
-                const noResults=/^(?:brak\b.*(?:wynik|rekord|firm|przewoznik).*|nie znaleziono\b.*|no results\b.*)[.!\s]*$/.test(plain);
-                state.empty=!text(body)||!parsed.querySelector('a,form,input,script')&&
-                    (emptyList&&(!plain||noResults)||noResults);
-            }
-            onChange();
-        };
-        let wrappedOpen,wrappedSend,wrappedFetch;
-        if(proto&&open&&send){
-            wrappedOpen=pageFunction(function(...args){metadata.set(this,String(args[1]||''));return open.apply(this,args);},w);
-            wrappedSend=pageFunction(function(...args){
-                if(contains(metadata.get(this)||'')||contains(args[0])){
-                    state.started++;state.pending++;
-                    this.addEventListener('loadend',pageFunction(()=>{let body='';try{body=this.responseText;}catch{}complete(Number(this.status)||0,body);},w),pageObject({once:true},w));
-                }
-                return send.apply(this,args);
-            },w);
-            proto.open=wrappedOpen;proto.send=wrappedSend;
-        }
-        if(typeof fetch==='function'){
-            wrappedFetch=pageFunction(function(input,init){
-                const match=contains(typeof input==='string'?input:input?.url||'')||contains(init?.body);
-                if(match){state.started++;state.pending++;}
-                let result;
-                try{result=fetch.apply(this,arguments);}catch(error){if(match)complete(0,'');throw error;}
-                if(match)Promise.resolve(result).then(async response=>{
-                    try{complete(response.status,await response.clone().text());}catch{complete(0,'');}
-                },()=>complete(0,''));
-                return result;
-            },w);
-            w.fetch=wrappedFetch;
-        }
-        state.restore=()=>{
-            if(proto?.open===wrappedOpen)proto.open=open;
-            if(proto?.send===wrappedSend)proto.send=send;
-            if(w.fetch===wrappedFetch)w.fetch=fetch;
-        };
-        return state;
-    }
     async function autocomplete(frame, selector, nip) {
-        const doc=frame.contentDocument, input=doc?.querySelector(selector);
-        if (!input) throw new Error('Brak wyszukiwarki intranetu. Sprawdź logowanie.');
+        const doc=frame.contentDocument,input=doc?.querySelector(selector);
+        if(!input)throw new Error('Brak wyszukiwarki intranetu. Sprawdź logowanie.');
         const w=frame.contentWindow.wrappedJSObject||frame.contentWindow;
-        let check=()=>{};
-        const receipt=watchSearchResponses(w,nip,()=>check());
-        try{
-            return await new Promise((resolve,reject)=>{
-            let settled=false;
-            const observer=new MutationObserver(()=>check());
-            const timer=setTimeout(()=>finish(new Error('Brak potwierdzonej odpowiedzi wyszukiwarki intranetu. Sprawdź logowanie i ponów odczyt.')),10000);
-            const finish=(error,result)=>{if(settled)return;settled=true;clearTimeout(timer);observer.disconnect();error?reject(error):resolve(result);};
-            check=()=>{
-                if(settled||!receipt.started||receipt.pending!==0||!receipt.finishedAt)return;
-                if(receipt.status<200||receipt.status>=300)return finish(new Error(`Wyszukiwarka intranetu: HTTP ${receipt.status}.`));
-                const box=doc.querySelector('#results3');
-                const matches=Array.from(box?.querySelectorAll('a')||[]).filter(link=>exactNipInText(link.textContent,nip));
-                if(matches.length>1)return finish(new Error('Kilka wyników dla tego NIP-u. Sprawdź firmę w intranecie.'));
-                if(receipt.positive&&matches.length===1)return finish(null,{link:matches[0],input});
-                if(receipt.empty&&box&&!box.querySelector('a'))return finish(null,{link:null,input});
-                if(!receipt.positive&&!receipt.empty)finish(new Error('Wynik wyszukiwania nie potwierdza NIP-u. Nie oznaczam firmy jako brakującej.'));
-            };
-            observer.observe(doc.documentElement,{childList:true,subtree:true,characterData:true});
+        const method=selector==='#k_id'?'autosuggest2':'autosuggest_przewoznik';
+        const xhr=w.http;
+        if(typeof w[method]!=='function'||!xhr?.addEventListener)throw new Error('Nie znaleziono natywnej funkcji wyszukiwania intranetu: '+method+'.');
+        input.value=nip;
+        return new Promise((resolve,reject)=>{
+            let settled=false,started=false;
+            const finish=(error,result)=>{if(settled)return;settled=true;clearTimeout(timer);xhr.removeEventListener('loadend',listener,false);error?reject(error):resolve(result);};
+            const listener=pageFunction(()=>{
+                if(!started||xhr.readyState!==4)return;
+                try{
+                    const status=Number(xhr.status)||0;
+                    if(status<200||status>=300)return finish(new Error('Wyszukiwarka intranetu: HTTP '+status+'.'));
+                    const body=String(xhr.responseText||''),parsed=new DOMParser().parseFromString(body,'text/html');
+                    const links=Array.from(parsed.querySelectorAll('a'));
+                    const exact=links.filter(link=>exactNipInText(link.textContent,nip));
+                    if(exact.length>1)return finish(new Error('Kilka wyników dla tego NIP-u. Sprawdź firmę w intranecie.'));
+                    if(exact.length===1){
+                        const matches=Array.from(doc.querySelectorAll('#results3 a')).filter(link=>exactNipInText(link.textContent,nip));
+                        if(matches.length===1)return finish(null,{link:matches[0],input});
+                        return finish(new Error('Odpowiedź zawiera NIP, ale lista intranetu nie została uzupełniona.'));
+                    }
+                    const list=parsed.body.children.length===1&&parsed.body.firstElementChild.tagName==='UL';
+                    const clean=!parsed.querySelector('form,input,script')&&!/fatal error|warning:|ora-\d|sqlstate/i.test(body);
+                    // A completed native search may return an empty body, an empty
+                    // list, a list with a no-result label, or other NIP matches.
+                    const otherNips=links.length>0&&links.every(link=>/\b(?:PL[\s-]*)?\d{3}[\s-]?\d{3}[\s-]?\d{2}[\s-]?\d{2}\b/i.test(link.textContent));
+                    const noResults=/^(?:brak\b.*|nie znaleziono\b.*|no results\b.*)$/i.test(fold(parsed.body.textContent));
+                    if(!text(body)||clean&&(list&&(!links.length||otherNips)||noResults))return finish(null,{link:null,input});
+                    finish(new Error('Nierozpoznana odpowiedź wyszukiwarki '+selector+' (HTTP '+status+', listy: '+parsed.querySelectorAll('ul').length+', odnośniki: '+links.length+').'));
+                }catch(error){finish(error);}
+            },w);
+            const timer=setTimeout(()=>finish(new Error('Natywna wyszukiwarka intranetu nie odpowiedziała: '+method+'.')),10000);
             try{
-            input.focus();input.value=nip;
-            // Construct DOM events in the userscript realm. Page constructors
-            // cannot read a Firefox userscript's EventInit object reliably.
-            input.dispatchEvent(new Event('input',{bubbles:true}));
-            const keyCode=48+Number(nip.slice(-1));
-            input.dispatchEvent(new KeyboardEvent('keyup',{bubbles:true,key:nip.slice(-1),code:`Digit${nip.slice(-1)}`,keyCode,which:keyCode}));
-            input.dispatchEvent(new Event('change',{bubbles:true}));
-            check();
+                xhr.addEventListener('loadend',listener,false);
+                started=true;
+                w[method]();
             }catch(error){finish(error);}
-            });
-        }finally{receipt.restore();}
+        });
     }
     async function inspectClient(nip) {
         const frame=await lookupFrame('/spedycja_uss_2022//oferta/dodanie.php');
